@@ -5,6 +5,8 @@ use actix_web::{get, web, App, HttpResponse, HttpServer};
 use clap::Parser;
 use hex::ToHex;
 
+use std::io::prelude::*;
+
 use secp256k1_zkp::{
     rand, All, KeyPair, Message, Secp256k1, SecretKey, XOnlyPublicKey as SchnorrPublicKey,
 };
@@ -419,7 +421,10 @@ async fn main() -> anyhow::Result<()> {
     let secret_key = match args.secret_key_file {
         None => {
             info!("no secret key file was found, generating secret key");
-            secp.generate_keypair(&mut rand::thread_rng()).0
+            let new_key = secp.generate_keypair(&mut rand::thread_rng()).0;
+            let mut file = File::create("config/secret.key")?;
+            file.write_all(new_key.display_secret().to_string().as_bytes())?;
+            new_key
         }
         Some(path) => {
             info!(
