@@ -4,7 +4,7 @@ use secp256k1_zkp::All;
 use secp256k1_zkp::KeyPair;
 use secp256k1_zkp::Secp256k1;
 use serde::{Deserialize, Serialize};
-use sled::Db;
+use sled::{Config, Db};
 
 mod error;
 pub use error::OracleError;
@@ -44,7 +44,11 @@ impl Oracle {
         // setup event database
         let path = format!("events/{}", asset_pair_info.asset_pair);
         info!("creating sled at {}", path);
-        let event_database = sled::open(path)?;
+        // let event_database = sled::open(path)?;
+        let event_database = Config::new()
+            .path(path)
+            .cache_capacity(128 * 1024 * 1024)
+            .open()?;
 
         Ok(Oracle {
             oracle_config,

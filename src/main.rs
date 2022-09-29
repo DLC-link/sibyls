@@ -144,7 +144,7 @@ async fn create_event(
     );
     let (announcement_obj, outstanding_sk_nonces) = match build_announcement_response {
         Ok((a, o)) => (a, o),
-        Err(error) => return Err(SibylsError::SignatureError(path.to_string()).into()), //actix_web::Error(erro)
+        Err(_error) => return Err(SibylsError::SignatureError(path.to_string()).into()), //actix_web::Error(erro)
     };
 
     info!(
