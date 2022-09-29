@@ -1,6 +1,8 @@
 use crate::{AssetPairInfo, OracleConfig};
 use log::info;
+use secp256k1_zkp::All;
 use secp256k1_zkp::KeyPair;
+use secp256k1_zkp::Secp256k1;
 use serde::{Deserialize, Serialize};
 use sled::Db;
 
@@ -23,6 +25,7 @@ pub struct Oracle {
     asset_pair_info: AssetPairInfo,
     pub event_database: Db,
     keypair: KeyPair,
+    secp: Secp256k1<All>,
 }
 
 impl Oracle {
@@ -30,6 +33,7 @@ impl Oracle {
         oracle_config: OracleConfig,
         asset_pair_info: AssetPairInfo,
         keypair: KeyPair,
+        secp: Secp256k1<All>,
     ) -> Result<Oracle> {
         if !oracle_config.announcement_offset.is_positive() {
             return Err(OracleError::InvalidAnnouncementTimeError(
@@ -47,7 +51,18 @@ impl Oracle {
             asset_pair_info,
             event_database,
             keypair,
+            secp,
         })
+    }
+
+    pub fn get_keypair(&self) -> &KeyPair {
+        &self.keypair
+    }
+    pub fn get_secp(&self) -> &Secp256k1<All> {
+        &self.secp
+    }
+    pub fn get_asset_pair_info(&self) -> &AssetPairInfo {
+        &self.asset_pair_info
     }
 }
 

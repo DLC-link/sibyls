@@ -13,6 +13,9 @@ pub enum SibylsError {
     /// oracle event with maturation {0} not found
     OracleEventNotFoundError(String),
 
+    /// an error occured within the cryptographic libraries.
+    SignatureError(String),
+
     /// database error: {0}
     DatabaseError(#[from] sled::Error),
 }

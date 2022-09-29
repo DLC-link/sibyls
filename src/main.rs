@@ -4,7 +4,12 @@ extern crate log;
 use actix_web::{get, web, App, HttpResponse, HttpServer};
 use clap::Parser;
 use hex::ToHex;
-use secp256k1_zkp::{rand, KeyPair, Secp256k1, SecretKey};
+
+use secp256k1_zkp::{
+    rand, All, KeyPair, Message, Secp256k1, SecretKey, XOnlyPublicKey as SchnorrPublicKey,
+};
+use secp256k1_zkp_5::rand::RngCore;
+
 use serde::{Deserialize, Serialize};
 use sled::IVec;
 use std::{
@@ -17,11 +22,11 @@ use time::{format_description::well_known::Rfc3339, Duration, OffsetDateTime};
 
 use sibyls::{
     oracle::{
-        oracle_scheduler,
+        oracle_scheduler::{self, messaging::OracleAnnouncementHash},
         pricefeeds::{Bitstamp, GateIo, Kraken, PriceFeed},
         DbValue, Oracle,
     },
-    AssetPair, AssetPairInfo, OracleConfig,
+    Announcement, AssetPair, AssetPairInfo, OracleConfig, OracleEvent,
 };
 
 mod error;
@@ -76,6 +81,172 @@ fn parse_database_entry(
         maturation,
         outcome: event.3,
     }
+}
+
+pub fn build_announcement(
+    asset_pair_info: &AssetPairInfo,
+    keypair: &KeyPair,
+    secp: &Secp256k1<All>,
+    maturation: OffsetDateTime,
+) -> Result<(Announcement, Vec<[u8; 32]>), secp256k1_zkp::UpstreamError> {
+    let mut rng = rand::thread_rng();
+    let digits = asset_pair_info.event_descriptor.num_digits; // This is always going to be 5 or so, because that's the precision we will have in our Alice/Bob contract
+    let mut sk_nonces = Vec::with_capacity(digits.into());
+    let mut nonces = Vec::with_capacity(digits.into());
+    for _ in 0..digits {
+        let mut sk_nonce = [0u8; 32];
+        rng.fill_bytes(&mut sk_nonce);
+        let oracle_r_kp = secp256k1_zkp::KeyPair::from_seckey_slice(secp, &sk_nonce)?;
+        let nonce = SchnorrPublicKey::from_keypair(&oracle_r_kp);
+        sk_nonces.push(sk_nonce);
+        nonces.push(nonce);
+    }
+
+    let oracle_event = OracleEvent {
+        nonces,
+        maturation,
+        event_descriptor: asset_pair_info.event_descriptor.clone(),
+    };
+
+    Ok((
+        Announcement {
+            signature: secp.sign_schnorr(
+                &Message::from_hashed_data::<OracleAnnouncementHash>(&oracle_event.encode()),
+                keypair,
+            ),
+            oracle_pubkey: keypair.public_key(),
+            oracle_event,
+        },
+        sk_nonces,
+    ))
+}
+
+#[get("/create_event/{rfc3339_time}")]
+async fn create_event(
+    oracles: web::Data<HashMap<AssetPair, Oracle>>,
+    filters: web::Query<Filters>,
+    path: web::Path<String>,
+) -> actix_web::Result<HttpResponse, actix_web::Error> {
+    info!("GET /announcement/{}: {:#?}", path, filters);
+    let maturation =
+        OffsetDateTime::parse(&path, &Rfc3339).map_err(SibylsError::DatetimeParseError)?;
+
+    let oracle = match oracles.get(&filters.asset_pair) {
+        None => return Err(SibylsError::UnrecordedAssetPairError(filters.asset_pair).into()),
+        Some(val) => val,
+    };
+
+    let build_announcement_response = build_announcement(
+        &oracle.get_asset_pair_info(),
+        oracle.get_keypair(),
+        oracle.get_secp(),
+        maturation,
+    );
+    let (announcement_obj, outstanding_sk_nonces) = match build_announcement_response {
+        Ok((a, o)) => (a, o),
+        Err(error) => return Err(SibylsError::SignatureError(path.to_string()).into()), //actix_web::Error(erro)
+    };
+
+    info!(
+        "creating oracle event (announcement only) with maturation {} and announcement {:#?}",
+        maturation, announcement_obj
+    );
+
+    let db_value = DbValue(
+        Some(outstanding_sk_nonces),
+        announcement_obj.encode(),
+        None,
+        None,
+    );
+
+    oracle
+        .event_database
+        .insert(
+            maturation.format(&Rfc3339).unwrap().into_bytes(),
+            serde_json::to_string(&db_value)?.into_bytes(),
+        )
+        .unwrap();
+
+    Ok(HttpResponse::Ok().json("Success"))
+}
+
+#[get("/attest/{rfc3339_time}")]
+async fn attest(
+    oracles: web::Data<HashMap<AssetPair, Oracle>>,
+    filters: web::Query<Filters>,
+    path: web::Path<String>,
+) -> actix_web::Result<HttpResponse, actix_web::Error> {
+    info!("GET /announcement/{}: {:#?}", path, filters);
+    let _ = OffsetDateTime::parse(&path, &Rfc3339).map_err(SibylsError::DatetimeParseError)?;
+
+    let oracle = match oracles.get(&filters.asset_pair) {
+        None => return Err(SibylsError::UnrecordedAssetPairError(filters.asset_pair).into()),
+        Some(val) => val,
+    };
+
+    if oracle.event_database.is_empty() {
+        info!("no oracle events found");
+        return Err(SibylsError::OracleEventNotFoundError(path.to_string()).into());
+    }
+
+    info!("retrieving oracle event with maturation {}", path);
+    let event_ivec = match oracle
+        .event_database
+        .get(path.as_bytes())
+        .map_err(SibylsError::DatabaseError)?
+    {
+        Some(val) => val,
+        None => return Err(SibylsError::OracleEventNotFoundError(path.to_string()).into()),
+    };
+
+    let thing = parse_database_entry(filters.asset_pair, ((&**path).into(), event_ivec.clone()));
+    let mut event: DbValue = serde_json::from_str(&String::from_utf8_lossy(&event_ivec)).unwrap();
+
+    let outstanding_sk_nonces = event.clone().0.unwrap();
+
+    let outcome_ratio = 5555;
+    let num_digits_to_sign = 14;
+    // Here, we take the outcome of the DLC (0-10000), break it down into binary, break it into a vec of characters
+    let outcomes = format!(
+        "{:0width$b}",
+        outcome_ratio as u64,
+        width = num_digits_to_sign as usize
+    )
+    .chars()
+    .map(|char| char.to_string())
+    .collect::<Vec<_>>();
+
+    let attestation = sibyls::oracle::oracle_scheduler::build_attestation(
+        outstanding_sk_nonces,
+        oracle.get_keypair(),
+        &oracle.get_secp(),
+        outcomes,
+    );
+
+    println!("{:?}", attestation);
+    println!("{:?}", attestation.encode());
+
+    event.2 = Some(attestation.encode());
+    event.3 = Some(5555);
+
+    info!(
+        "attesting with maturation {} and attestation {:#?}",
+        path, attestation
+    );
+
+    let _insert_event = match oracle
+        .event_database
+        .insert(
+            path.clone().as_bytes(),
+            serde_json::to_string(&event)?.into_bytes(),
+        )
+        .map_err(SibylsError::DatabaseError)?
+    {
+        Some(val) => val,
+        None => return Err(SibylsError::OracleEventNotFoundError(path.to_string()).into()),
+    };
+
+    Ok(HttpResponse::Ok().json(thing))
 }
 
 #[get("/announcements")]
@@ -312,7 +483,7 @@ async fn main() -> anyhow::Result<()> {
 
             // create oracle
             info!("creating oracle for {}", asset_pair);
-            let oracle = Oracle::new(oracle_config, asset_pair_info, keypair)?;
+            let oracle = Oracle::new(oracle_config, asset_pair_info, keypair, secp.clone())?;
 
             // pricefeed retreival
             info!("creating pricefeeds for {}", asset_pair);
@@ -340,7 +511,9 @@ async fn main() -> anyhow::Result<()> {
                 web::scope("/v1")
                     .service(announcements)
                     .service(announcement)
-                    .service(config),
+                    .service(config)
+                    .service(attest)
+                    .service(create_event),
             )
     })
     .bind(("127.0.0.1", 8080))?

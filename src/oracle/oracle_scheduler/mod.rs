@@ -275,6 +275,7 @@ fn create_events(
             let oracle_scheduler_clone = oracle_scheduler.clone();
             let error_transmitter_clone = error_transmitter.clone();
             async move {
+                //finally here's the attest
                 if let Err(err) = oracle_scheduler_clone.lock().await.attest().await {
                     info!("error from attestation scheduler");
                     error_transmitter_clone.send(err).unwrap();
@@ -435,7 +436,7 @@ mod tests {
                     is_signed: false,
                     unit: "BTCUSD".to_string(),
                     precision: 0,
-                    num_digits: 18,
+                    num_digits: 18, // This will be 5 or so, because of our 0-100.00 set of outcomes
                 },
             },
             &keypair,
