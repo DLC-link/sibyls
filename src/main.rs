@@ -393,6 +393,25 @@ async fn config(
     ))
 }
 
+#[get("/publickey")]
+async fn publickey(
+    oracles: web::Data<HashMap<AssetPair, Oracle>>,
+) -> actix_web::Result<HttpResponse, actix_web::Error> {
+    info!("GET /publickey");
+    let mut secret_key = String::new();
+    let secp = Secp256k1::new();
+    File::open("config/secret.key")?.read_to_string(&mut secret_key)?;
+    secret_key.retain(|c| !c.is_whitespace());
+
+    let secret_key = match SecretKey::from_str(&secret_key) {
+        Ok(a) => (a),
+        Err(_error) => return Err(SibylsError::SignatureError("path".to_string()).into()), //actix_web::Error(erro)
+    };
+
+    let keypair = KeyPair::from_secret_key(&secp, secret_key);
+    Ok(HttpResponse::Ok().json(keypair.public_key().serialize().encode_hex::<String>()))
+}
+
 #[derive(Parser)]
 /// Simple DLC oracle implementation
 struct Args {
@@ -418,6 +437,7 @@ async fn main() -> anyhow::Result<()> {
     let mut secret_key = String::new();
     let secp = Secp256k1::new();
 
+    //TODO: this should only start with a key. If not present, should require a flag to create fresh
     let secret_key = match args.secret_key_file {
         None => {
             info!("no secret key file was found, generating secret key");
@@ -517,6 +537,7 @@ async fn main() -> anyhow::Result<()> {
                     .service(announcements)
                     .service(announcement)
                     .service(config)
+                    .service(publickey)
                     .service(attest)
                     .service(create_event),
             )
