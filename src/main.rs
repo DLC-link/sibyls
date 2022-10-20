@@ -1,18 +1,24 @@
 #[macro_use]
 extern crate log;
 
+use ::hex::ToHex;
 use actix_web::{get, web, App, HttpResponse, HttpServer};
 use clap::Parser;
-use hex::ToHex;
 
-use std::io::prelude::*;
-
+use core::ptr;
+use secp256k1_sys::{
+    types::{c_int, c_uchar, c_void, size_t},
+    CPtr, SchnorrSigExtraParams,
+};
 use secp256k1_zkp::{
-    rand, All, KeyPair, Message, Secp256k1, SecretKey, XOnlyPublicKey as SchnorrPublicKey,
+    constants::SCHNORR_SIGNATURE_SIZE, hashes::*, rand, schnorr::Signature as SchnorrSignature,
+    All, KeyPair, Message, Secp256k1, SecretKey, Signing, XOnlyPublicKey as SchnorrPublicKey,
 };
 use secp256k1_zkp_5::rand::RngCore;
+use std::io::{prelude::*, Cursor};
 
 use serde::{Deserialize, Serialize};
+
 use sled::IVec;
 use std::{
     collections::HashMap,
@@ -28,11 +34,28 @@ use sibyls::{
         pricefeeds::{Bitstamp, GateIo, Kraken, PriceFeed},
         DbValue, Oracle,
     },
-    Announcement, AssetPair, AssetPairInfo, OracleConfig, OracleEvent,
+    Announcement, AssetPair, AssetPairInfo, Attestation, EventDescriptor, OracleConfig,
+    OracleEvent,
 };
 
 mod error;
 use error::SibylsError;
+
+extern "C" fn constant_nonce_fn(
+    nonce32: *mut c_uchar,
+    _: *const c_uchar,
+    _: size_t,
+    _: *const c_uchar,
+    _: *const c_uchar,
+    _: *const c_uchar,
+    _: size_t,
+    data: *mut c_void,
+) -> c_int {
+    unsafe {
+        ptr::copy_nonoverlapping(data as *const c_uchar, nonce32, 32);
+    }
+    1
+}
 
 const PAGE_SIZE: u32 = 100;
 
@@ -49,6 +72,8 @@ struct Filters {
     sort_by: SortOrder,
     page: u32,
     asset_pair: AssetPair,
+    maturation: String,
+    outcome: Option<u64>,
 }
 
 impl Default for Filters {
@@ -57,15 +82,23 @@ impl Default for Filters {
             sort_by: SortOrder::ReverseInsertion,
             page: 0,
             asset_pair: AssetPair::BTCUSD,
+            maturation: "".to_string(),
+            outcome: None,
         }
     }
 }
 
 #[derive(Serialize)]
 struct ApiOracleEvent {
+    event_id: String,
+    uuid: String,
     asset_pair: AssetPair,
-    announcement: String,
-    attestation: Option<String>,
+    suredbits_announcement: String,
+    rust_announcement_json: String,
+    rust_announcement: String,
+    suredbits_attestation: Option<String>,
+    rust_attestation_json: Option<String>,
+    rust_attestation: Option<String>,
     maturation: String,
     outcome: Option<u64>,
 }
@@ -76,25 +109,62 @@ fn parse_database_entry(
 ) -> ApiOracleEvent {
     let maturation = String::from_utf8_lossy(&maturation).to_string();
     let event: DbValue = serde_json::from_str(&String::from_utf8_lossy(&event)).unwrap();
+
+    let mut announcement_cursor = Cursor::new(&event.3);
+    let decoded_announcement =
+        <dlc_messages::oracle_msgs::OracleAnnouncement as lightning::util::ser::Readable>::read(
+            &mut announcement_cursor,
+        )
+        .unwrap();
+    let decoded_ann_json = format!("{:?}", decoded_announcement);
+
+    // let mut dann_hex = Vec::new();
+    // <dlc_messages::oracle_msgs::OracleAnnouncement as lightning::util::ser::Writeable>::write(
+    //     &decoded_announcement,
+    //     &mut dann_hex,
+    // )
+    // .expect("Error writing oracle event");
+
+    let mut decoded_att_json: Option<String> = None;
+    let db_att = event.4.clone();
+    let decoded_attestation = match db_att {
+        None => None,
+        Some(att_vec) => {
+            let mut attestation_cursor = Cursor::new(&att_vec);
+
+            <dlc_messages::oracle_msgs::OracleAttestation as lightning::util::ser::Readable>::read(
+                &mut attestation_cursor,
+            )
+            .ok()
+        }
+    };
+    decoded_att_json = Some(format!("{:?}", decoded_attestation));
+
     ApiOracleEvent {
+        event_id: decoded_announcement.oracle_event.event_id.clone(),
+        uuid: event.6,
         asset_pair,
-        announcement: event.1.encode_hex::<String>(),
-        attestation: event.2.map(|att| att.encode_hex::<String>()),
+        suredbits_announcement: event.1.encode_hex::<String>(),
+        rust_announcement_json: decoded_ann_json,
+        rust_announcement: event.3.encode_hex::<String>(),
+        suredbits_attestation: event.2.map(|att| att.encode_hex::<String>()),
+        rust_attestation_json: decoded_att_json,
+        rust_attestation: event.4.map(|att| att.encode_hex::<String>()),
         maturation,
-        outcome: event.3,
+        outcome: event.5,
     }
 }
 
 pub fn build_announcement(
-    asset_pair_info: &AssetPairInfo,
     keypair: &KeyPair,
     secp: &Secp256k1<All>,
     maturation: OffsetDateTime,
+    event_id: String,
 ) -> Result<(Announcement, Vec<[u8; 32]>), secp256k1_zkp::UpstreamError> {
     let mut rng = rand::thread_rng();
-    let digits = asset_pair_info.event_descriptor.num_digits; // This is always going to be 5 or so, because that's the precision we will have in our Alice/Bob contract
-    let mut sk_nonces = Vec::with_capacity(digits.into());
-    let mut nonces = Vec::with_capacity(digits.into());
+    let digits = 10; // This is always going to be 5 or so, because that's the precision we will have in our Alice/Bob contract
+    let mut sk_nonces = Vec::with_capacity(digits);
+    let mut nonces = Vec::with_capacity(digits);
     for _ in 0..digits {
         let mut sk_nonce = [0u8; 32];
         rng.fill_bytes(&mut sk_nonce);
@@ -104,82 +174,150 @@ pub fn build_announcement(
         nonces.push(nonce);
     }
 
+    let event_descriptor = EventDescriptor {
+        base: 2,
+        is_signed: false,
+        unit: "BTCUSD".to_string(),
+        precision: 0,
+        num_digits: 10, // This will be 5 or so, because of our 0-100.00 set of outcomes
+    };
+
     let oracle_event = OracleEvent {
         nonces,
         maturation,
-        event_descriptor: asset_pair_info.event_descriptor.clone(),
+        event_descriptor: event_descriptor.clone(),
+        event_id,
     };
 
-    Ok((
-        Announcement {
-            signature: secp.sign_schnorr(
-                &Message::from_hashed_data::<OracleAnnouncementHash>(&oracle_event.encode()),
-                keypair,
-            ),
-            oracle_pubkey: keypair.public_key(),
-            oracle_event,
-        },
-        sk_nonces,
-    ))
+    let ann = Announcement {
+        signature: secp.sign_schnorr(
+            &Message::from_hashed_data::<OracleAnnouncementHash>(&oracle_event.encode()),
+            keypair,
+        ),
+        oracle_pubkey: keypair.public_key(),
+        oracle_event,
+    };
+    Ok((ann, sk_nonces))
 }
 
-#[get("/create_event/{rfc3339_time}")]
+pub fn build_attestation(
+    outstanding_sk_nonces: Vec<[u8; 32]>,
+    keypair: &KeyPair,
+    secp: &Secp256k1<All>,
+    outcomes: Vec<String>,
+) -> Attestation {
+    let signatures = outcomes
+        .iter()
+        .zip(outstanding_sk_nonces.iter())
+        .map(|(outcome, outstanding_sk_nonce)| {
+            sign_schnorr_with_nonce(
+                secp,
+                &Message::from_hashed_data::<sha256::Hash>(
+                    // &Message::from_hashed_data::<secp256k1_zkp_5::bitcoin_hashes::sha256::Hash>(
+                    outcome.as_bytes(),
+                ),
+                keypair,
+                outstanding_sk_nonce,
+            )
+        })
+        .collect::<Vec<_>>();
+    Attestation {
+        oracle_pubkey: keypair.public_key(),
+        signatures,
+        outcomes,
+    }
+}
+
+fn sign_schnorr_with_nonce<S: Signing>(
+    secp: &Secp256k1<S>,
+    msg: &Message,
+    keypair: &KeyPair,
+    nonce: &[u8; 32],
+) -> SchnorrSignature {
+    unsafe {
+        let mut sig = [0u8; SCHNORR_SIGNATURE_SIZE];
+        let nonce_params =
+            SchnorrSigExtraParams::new(Some(constant_nonce_fn), nonce.as_c_ptr() as *const c_void);
+        assert_eq!(
+            1,
+            secp256k1_sys::secp256k1_schnorrsig_sign_custom(
+                *secp.ctx(),
+                sig.as_mut_c_ptr(),
+                msg.as_c_ptr(),
+                msg.len(),
+                keypair.as_ptr(),
+                &nonce_params as *const SchnorrSigExtraParams
+            )
+        );
+
+        SchnorrSignature::from_slice(&sig).unwrap()
+    }
+}
+
+#[get("/create_event/{uuid}")]
 async fn create_event(
     oracles: web::Data<HashMap<AssetPair, Oracle>>,
     filters: web::Query<Filters>,
     path: web::Path<String>,
 ) -> actix_web::Result<HttpResponse, actix_web::Error> {
-    info!("GET /announcement/{}: {:#?}", path, filters);
-    let maturation =
-        OffsetDateTime::parse(&path, &Rfc3339).map_err(SibylsError::DatetimeParseError)?;
+    info!("GET /create_event/{}: {:#?}", path, filters);
+    let uuid = path.to_string();
+    let maturation = OffsetDateTime::parse(&filters.maturation, &Rfc3339)
+        .map_err(SibylsError::DatetimeParseError)?;
+
+    info!(
+        "Creating event for uuid:{} and maturation_time :{}",
+        uuid, maturation
+    );
 
     let oracle = match oracles.get(&filters.asset_pair) {
         None => return Err(SibylsError::UnrecordedAssetPairError(filters.asset_pair).into()),
         Some(val) => val,
     };
 
-    let build_announcement_response = build_announcement(
-        &oracle.get_asset_pair_info(),
+    let (announcement_obj, outstanding_sk_nonces) = build_announcement(
         oracle.get_keypair(),
         oracle.get_secp(),
         maturation,
-    );
-    let (announcement_obj, outstanding_sk_nonces) = match build_announcement_response {
-        Ok((a, o)) => (a, o),
-        Err(_error) => return Err(SibylsError::SignatureError(path.to_string()).into()), //actix_web::Error(erro)
-    };
+        uuid.clone(),
+    )
+    .unwrap();
 
-    info!(
-        "creating oracle event (announcement only) with maturation {} and announcement {:#?}",
-        maturation, announcement_obj
+    let response = format!(
+        "creating oracle event (announcement only) with uuid {} and maturation {}",
+        uuid, maturation
     );
 
     let db_value = DbValue(
         Some(outstanding_sk_nonces),
+        announcement_obj.suredbits_encode(),
+        None,
         announcement_obj.encode(),
         None,
         None,
+        uuid.clone(),
     );
 
     oracle
         .event_database
         .insert(
-            maturation.format(&Rfc3339).unwrap().into_bytes(),
+            uuid.into_bytes(),
             serde_json::to_string(&db_value)?.into_bytes(),
         )
         .unwrap();
 
-    Ok(HttpResponse::Ok().json("Success"))
+    Ok(HttpResponse::Ok().json(response))
 }
 
-#[get("/attest/{rfc3339_time}")]
+#[get("/attest/{uuid}")]
 async fn attest(
     oracles: web::Data<HashMap<AssetPair, Oracle>>,
     filters: web::Query<Filters>,
     path: web::Path<String>,
 ) -> actix_web::Result<HttpResponse, actix_web::Error> {
     info!("GET /announcement/{}: {:#?}", path, filters);
-    let _ = OffsetDateTime::parse(&path, &Rfc3339).map_err(SibylsError::DatetimeParseError)?;
+    let uuid = path.to_string();
+    let outcome = &filters.outcome.unwrap();
 
     let oracle = match oracles.get(&filters.asset_pair) {
         None => return Err(SibylsError::UnrecordedAssetPairError(filters.asset_pair).into()),
@@ -188,7 +326,7 @@ async fn attest(
 
     if oracle.event_database.is_empty() {
         info!("no oracle events found");
-        return Err(SibylsError::OracleEventNotFoundError(path.to_string()).into());
+        return Err(SibylsError::OracleEventNotFoundError(uuid).into());
     }
 
     info!("retrieving oracle event with maturation {}", path);
@@ -198,7 +336,7 @@ async fn attest(
         .map_err(SibylsError::DatabaseError)?
     {
         Some(val) => val,
-        None => return Err(SibylsError::OracleEventNotFoundError(path.to_string()).into()),
+        None => return Err(SibylsError::OracleEventNotFoundError(uuid).into()),
     };
 
     let thing = parse_database_entry(filters.asset_pair, ((&**path).into(), event_ivec.clone()));
@@ -206,30 +344,26 @@ async fn attest(
 
     let outstanding_sk_nonces = event.clone().0.unwrap();
 
-    let outcome_ratio = 5555;
-    let num_digits_to_sign = 14;
+    let num_digits_to_sign = 10;
     // Here, we take the outcome of the DLC (0-10000), break it down into binary, break it into a vec of characters
-    let outcomes = format!(
-        "{:0width$b}",
-        outcome_ratio as u64,
-        width = num_digits_to_sign as usize
-    )
-    .chars()
-    .map(|char| char.to_string())
-    .collect::<Vec<_>>();
+    let outcomes = format!("{:0width$b}", outcome, width = num_digits_to_sign as usize)
+        .chars()
+        .map(|char| char.to_string())
+        .collect::<Vec<_>>();
 
-    let attestation = sibyls::oracle::oracle_scheduler::build_attestation(
+    let attestation = build_attestation(
         outstanding_sk_nonces,
         oracle.get_keypair(),
         &oracle.get_secp(),
         outcomes,
     );
 
-    println!("{:?}", attestation);
-    println!("{:?}", attestation.encode());
+    // println!("{:?}", attestation);
+    // println!("{:?}", attestation.encode());
 
-    event.2 = Some(attestation.encode());
-    event.3 = Some(5555);
+    event.2 = Some(attestation.suredbits_encode());
+    event.5 = Some(*outcome);
+    event.4 = Some(attestation.encode());
 
     info!(
         "attesting with maturation {} and attestation {:#?}",
@@ -245,7 +379,7 @@ async fn attest(
         .map_err(SibylsError::DatabaseError)?
     {
         Some(val) => val,
-        None => return Err(SibylsError::OracleEventNotFoundError(path.to_string()).into()),
+        None => return Err(SibylsError::OracleEventNotFoundError(uuid).into()),
     };
 
     Ok(HttpResponse::Ok().json(thing))
@@ -267,91 +401,139 @@ async fn announcements(
         return Ok(HttpResponse::Ok().json(Vec::<ApiOracleEvent>::new()));
     }
 
-    let start = filters.page * PAGE_SIZE;
+    return Ok(HttpResponse::Ok().json(
+        oracle
+            .event_database
+            .iter()
+            .map(|result| parse_database_entry(filters.asset_pair, result.unwrap()))
+            .collect::<Vec<_>>(),
+    ));
 
-    match filters.sort_by {
-        SortOrder::Insertion => loop {
-            let init_key = oracle
-                .event_database
-                .first()
-                .map_err(SibylsError::DatabaseError)?
-                .unwrap()
-                .0;
-            let start_key = OffsetDateTime::parse(&String::from_utf8_lossy(&init_key), &Rfc3339)
-                .unwrap()
-                + Duration::days(start.into());
-            let end_key = start_key + Duration::days(PAGE_SIZE.into());
-            let start_key = start_key.format(&Rfc3339).unwrap().into_bytes();
-            let end_key = end_key.format(&Rfc3339).unwrap().into_bytes();
-            if init_key
-                == oracle
-                    .event_database
-                    .first()
-                    .map_err(SibylsError::DatabaseError)?
-                    .unwrap()
-                    .0
-            {
-                // don't know if range can change while iterating due to another thread modifying
-                info!(
-                    "retrieving oracle events from {} to {}",
-                    String::from_utf8_lossy(&start_key),
-                    String::from_utf8_lossy(&end_key),
-                );
-                return Ok(HttpResponse::Ok().json(
-                    oracle
-                        .event_database
-                        .range(start_key..end_key)
-                        .map(|result| parse_database_entry(filters.asset_pair, result.unwrap()))
-                        .collect::<Vec<_>>(),
-                ));
-            }
-        },
-        SortOrder::ReverseInsertion => loop {
-            let init_key = oracle
-                .event_database
-                .last()
-                .map_err(SibylsError::DatabaseError)?
-                .unwrap()
-                .0;
-            let end_key = OffsetDateTime::parse(&String::from_utf8_lossy(&init_key), &Rfc3339)
-                .unwrap()
-                - Duration::days(start.into());
-            let start_key = end_key - Duration::days(PAGE_SIZE.into());
-            let start_key = start_key.format(&Rfc3339).unwrap().into_bytes();
-            let end_key = end_key.format(&Rfc3339).unwrap().into_bytes();
-            if init_key
-                == oracle
-                    .event_database
-                    .last()
-                    .map_err(SibylsError::DatabaseError)?
-                    .unwrap()
-                    .0
-            {
-                // don't know if range can change while iterating due to another thread modifying
-                info!(
-                    "retrieving oracle events from {} to {}",
-                    String::from_utf8_lossy(&start_key),
-                    String::from_utf8_lossy(&end_key),
-                );
-                return Ok(HttpResponse::Ok().json(
-                    oracle
-                        .event_database
-                        .range(start_key..end_key)
-                        .map(|result| parse_database_entry(filters.asset_pair, result.unwrap()))
-                        .collect::<Vec<_>>(),
-                ));
-            }
-        },
-    }
+    // let start = filters.page * PAGE_SIZE;
+
+    // println!("{:?}", filters.sort_by);
+
+    // match filters.sort_by {
+    //     SortOrder::Insertion => loop {
+    //         let init_key = oracle
+    //             .event_database
+    //             .first()
+    //             .map_err(SibylsError::DatabaseError)?
+    //             .unwrap()
+    //             .0;
+    //         let start_key = OffsetDateTime::parse(&String::from_utf8_lossy(&init_key), &Rfc3339)
+    //             .unwrap()
+    //             + Duration::days(start.into());
+    //         let end_key = start_key + Duration::days(PAGE_SIZE.into());
+    //         let start_key = start_key.format(&Rfc3339).unwrap().into_bytes();
+    //         let end_key = end_key.format(&Rfc3339).unwrap().into_bytes();
+    //         if init_key
+    //             == oracle
+    //                 .event_database
+    //                 .first()
+    //                 .map_err(SibylsError::DatabaseError)?
+    //                 .unwrap()
+    //                 .0
+    //         {
+    //             // don't know if range can change while iterating due to another thread modifying
+    //             info!(
+    //                 "retrieving oracle events from {} to {}",
+    //                 String::from_utf8_lossy(&start_key),
+    //                 String::from_utf8_lossy(&end_key),
+    //             );
+    //             return Ok(HttpResponse::Ok().json(
+    //                 oracle
+    //                     .event_database
+    //                     .range(start_key..end_key)
+    //                     .map(|result| parse_database_entry(filters.asset_pair, result.unwrap()))
+    //                     .collect::<Vec<_>>(),
+    //             ));
+    //         }
+    //     },
+    //     SortOrder::ReverseInsertion => loop {
+    //         let init_key = oracle
+    //             .event_database
+    //             .last()
+    //             .map_err(SibylsError::DatabaseError)?
+    //             .unwrap()
+    //             .0;
+    //         let end_key = OffsetDateTime::parse(&String::from_utf8_lossy(&init_key), &Rfc3339)
+    //             .unwrap()
+    //             - Duration::days(start.into());
+    //         let start_key = end_key - Duration::days(PAGE_SIZE.into());
+    //         let start_key = start_key.format(&Rfc3339).unwrap().into_bytes();
+    //         let end_key = end_key.format(&Rfc3339).unwrap().into_bytes();
+    //         if init_key
+    //             == oracle
+    //                 .event_database
+    //                 .last()
+    //                 .map_err(SibylsError::DatabaseError)?
+    //                 .unwrap()
+    //                 .0
+    //         {
+    //             // don't know if range can change while iterating due to another thread modifying
+    //             info!(
+    //                 "retrieving oracle events from {} to {}",
+    //                 String::from_utf8_lossy(&start_key),
+    //                 String::from_utf8_lossy(&end_key),
+    //             );
+    //             return Ok(HttpResponse::Ok().json(
+    //                 oracle
+    //                     .event_database
+    //                     .range(start_key..=end_key)
+    //                     .map(|result| parse_database_entry(filters.asset_pair, result.unwrap()))
+    //                     .collect::<Vec<_>>(),
+    //             ));
+    //         }
+    //     },
+    // }
 }
 
-#[get("/announcement/{rfc3339_time}")]
-async fn announcement(
+#[get("/announcement/{uuid}")]
+async fn get_announcement(
     oracles: web::Data<HashMap<AssetPair, Oracle>>,
     filters: web::Query<Filters>,
     path: web::Path<String>,
 ) -> actix_web::Result<HttpResponse, actix_web::Error> {
     info!("GET /announcement/{}: {:#?}", path, filters);
+    let uuid = path.to_string();
+
+    let oracle = match oracles.get(&filters.asset_pair) {
+        None => return Err(SibylsError::UnrecordedAssetPairError(filters.asset_pair).into()),
+        Some(val) => val,
+    };
+
+    if oracle.event_database.is_empty() {
+        info!("no oracle events found");
+        return Err(SibylsError::OracleEventNotFoundError(path.to_string()).into());
+    }
+
+    info!("retrieving oracle event with uuid {}", uuid);
+    let event = match oracle
+        .event_database
+        .get(uuid.as_bytes())
+        .map_err(SibylsError::DatabaseError)?
+    {
+        Some(val) => val,
+        None => return Err(SibylsError::OracleEventNotFoundError(path.to_string()).into()),
+    };
+    Ok(HttpResponse::Ok().json(parse_database_entry(
+        filters.asset_pair,
+        ((&**path).into(), event),
+    )))
+    // Ok(HttpResponse::Ok().json(get_announcement_as_json(
+    //     filters.asset_pair,
+    //     ((&**path).into(), event),
+    // )))
+}
+
+#[get("/attestation/{rfc3339_time}")]
+async fn get_attestation(
+    oracles: web::Data<HashMap<AssetPair, Oracle>>,
+    filters: web::Query<Filters>,
+    path: web::Path<String>,
+) -> actix_web::Result<HttpResponse, actix_web::Error> {
+    info!("GET /attestation/{}: {:#?}", path, filters);
     let _ = OffsetDateTime::parse(&path, &Rfc3339).map_err(SibylsError::DatetimeParseError)?;
 
     let oracle = match oracles.get(&filters.asset_pair) {
@@ -394,9 +576,7 @@ async fn config(
 }
 
 #[get("/publickey")]
-async fn publickey(
-    oracles: web::Data<HashMap<AssetPair, Oracle>>,
-) -> actix_web::Result<HttpResponse, actix_web::Error> {
+async fn publickey() -> actix_web::Result<HttpResponse, actix_web::Error> {
     info!("GET /publickey");
     let mut secret_key = String::new();
     let secp = Secp256k1::new();
@@ -508,19 +688,19 @@ async fn main() -> anyhow::Result<()> {
 
             // create oracle
             info!("creating oracle for {}", asset_pair);
-            let oracle = Oracle::new(oracle_config, asset_pair_info, keypair, secp.clone())?;
+            let oracle = Oracle::new(oracle_config, keypair, secp.clone())?;
 
-            // pricefeed retreival
-            info!("creating pricefeeds for {}", asset_pair);
-            let pricefeeds: Vec<Box<dyn PriceFeed + Send + Sync>> = vec![
-                Box::new(Bitstamp {}),
-                Box::new(GateIo {}),
-                Box::new(Kraken {}),
-            ];
+            // // pricefeed retreival
+            // info!("creating pricefeeds for {}", asset_pair);
+            // let pricefeeds: Vec<Box<dyn PriceFeed + Send + Sync>> = vec![
+            //     Box::new(Bitstamp {}),
+            //     Box::new(GateIo {}),
+            //     Box::new(Kraken {}),
+            // ];
 
-            info!("scheduling oracle events for {}", asset_pair);
-            // schedule oracle events (announcements/attestations)
-            oracle_scheduler::init(oracle.clone(), secp.clone(), pricefeeds)?;
+            // info!("scheduling oracle events for {}", asset_pair);
+            // // schedule oracle events (announcements/attestations)
+            // oracle_scheduler::init(oracle.clone(), secp.clone(), pricefeeds)?;
 
             Ok(oracle)
         }))
@@ -535,7 +715,8 @@ async fn main() -> anyhow::Result<()> {
             .service(
                 web::scope("/v1")
                     .service(announcements)
-                    .service(announcement)
+                    .service(get_announcement)
+                    .service(get_attestation)
                     .service(config)
                     .service(publickey)
                     .service(attest)

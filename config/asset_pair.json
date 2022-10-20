@@ -6,7 +6,7 @@
             "is_signed": false,
             "unit": "BTCUSD",
             "precision": 0,
-            "num_digits": 18
+            "num_digits": 10
         }
     }
 ]
