@@ -1,4 +1,4 @@
-use crate::{AssetPairInfo, OracleConfig};
+use crate::OracleConfig;
 use log::info;
 use secp256k1_zkp::All;
 use secp256k1_zkp::KeyPair;
@@ -67,7 +67,5 @@ impl Oracle {
     }
 }
 
-pub mod oracle_scheduler;
-pub use oracle_scheduler::messaging::EventDescriptor;
-
-pub mod pricefeeds;
+pub mod oracle_queryable;
+pub use oracle_queryable::messaging::EventDescriptor;

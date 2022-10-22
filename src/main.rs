@@ -26,14 +26,10 @@ use std::{
     io::Read,
     str::FromStr,
 };
-use time::{format_description::well_known::Rfc3339, Duration, OffsetDateTime};
+use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 
 use sibyls::{
-    oracle::{
-        oracle_scheduler::{self, messaging::OracleAnnouncementHash},
-        pricefeeds::{Bitstamp, GateIo, Kraken, PriceFeed},
-        DbValue, Oracle,
-    },
+    oracle::{oracle_queryable::messaging::OracleAnnouncementHash, DbValue, Oracle},
     Announcement, AssetPair, AssetPairInfo, Attestation, EventDescriptor, OracleConfig,
     OracleEvent,
 };
@@ -56,8 +52,6 @@ extern "C" fn constant_nonce_fn(
     }
     1
 }
-
-const PAGE_SIZE: u32 = 100;
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -118,27 +112,19 @@ fn parse_database_entry(
         .unwrap();
     let decoded_ann_json = format!("{:?}", decoded_announcement);
 
-    // let mut dann_hex = Vec::new();
-    // <dlc_messages::oracle_msgs::OracleAnnouncement as lightning::util::ser::Writeable>::write(
-    //     &decoded_announcement,
-    //     &mut dann_hex,
-    // )
-    // .expect("Error writing oracle event");
-
-    let mut decoded_att_json: Option<String> = None;
     let db_att = event.4.clone();
-    let decoded_attestation = match db_att {
+    let decoded_att_json = match db_att {
         None => None,
         Some(att_vec) => {
             let mut attestation_cursor = Cursor::new(&att_vec);
 
-            <dlc_messages::oracle_msgs::OracleAttestation as lightning::util::ser::Readable>::read(
+            let att_obj = <dlc_messages::oracle_msgs::OracleAttestation as lightning::util::ser::Readable>::read(
                 &mut attestation_cursor,
             )
-            .ok()
+            .ok();
+            Some(format!("{:?}", att_obj.unwrap()))
         }
     };
-    decoded_att_json = Some(format!("{:?}", decoded_attestation));
 
     ApiOracleEvent {
         event_id: decoded_announcement.oracle_event.event_id.clone(),
@@ -358,9 +344,6 @@ async fn attest(
         outcomes,
     );
 
-    // println!("{:?}", attestation);
-    // println!("{:?}", attestation.encode());
-
     event.2 = Some(attestation.suredbits_encode());
     event.5 = Some(*outcome);
     event.4 = Some(attestation.encode());
@@ -408,85 +391,6 @@ async fn announcements(
             .map(|result| parse_database_entry(filters.asset_pair, result.unwrap()))
             .collect::<Vec<_>>(),
     ));
-
-    // let start = filters.page * PAGE_SIZE;
-
-    // println!("{:?}", filters.sort_by);
-
-    // match filters.sort_by {
-    //     SortOrder::Insertion => loop {
-    //         let init_key = oracle
-    //             .event_database
-    //             .first()
-    //             .map_err(SibylsError::DatabaseError)?
-    //             .unwrap()
-    //             .0;
-    //         let start_key = OffsetDateTime::parse(&String::from_utf8_lossy(&init_key), &Rfc3339)
-    //             .unwrap()
-    //             + Duration::days(start.into());
-    //         let end_key = start_key + Duration::days(PAGE_SIZE.into());
-    //         let start_key = start_key.format(&Rfc3339).unwrap().into_bytes();
-    //         let end_key = end_key.format(&Rfc3339).unwrap().into_bytes();
-    //         if init_key
-    //             == oracle
-    //                 .event_database
-    //                 .first()
-    //                 .map_err(SibylsError::DatabaseError)?
-    //                 .unwrap()
-    //                 .0
-    //         {
-    //             // don't know if range can change while iterating due to another thread modifying
-    //             info!(
-    //                 "retrieving oracle events from {} to {}",
-    //                 String::from_utf8_lossy(&start_key),
-    //                 String::from_utf8_lossy(&end_key),
-    //             );
-    //             return Ok(HttpResponse::Ok().json(
-    //                 oracle
-    //                     .event_database
-    //                     .range(start_key..end_key)
-    //                     .map(|result| parse_database_entry(filters.asset_pair, result.unwrap()))
-    //                     .collect::<Vec<_>>(),
-    //             ));
-    //         }
-    //     },
-    //     SortOrder::ReverseInsertion => loop {
-    //         let init_key = oracle
-    //             .event_database
-    //             .last()
-    //             .map_err(SibylsError::DatabaseError)?
-    //             .unwrap()
-    //             .0;
-    //         let end_key = OffsetDateTime::parse(&String::from_utf8_lossy(&init_key), &Rfc3339)
-    //             .unwrap()
-    //             - Duration::days(start.into());
-    //         let start_key = end_key - Duration::days(PAGE_SIZE.into());
-    //         let start_key = start_key.format(&Rfc3339).unwrap().into_bytes();
-    //         let end_key = end_key.format(&Rfc3339).unwrap().into_bytes();
-    //         if init_key
-    //             == oracle
-    //                 .event_database
-    //                 .last()
-    //                 .map_err(SibylsError::DatabaseError)?
-    //                 .unwrap()
-    //                 .0
-    //         {
-    //             // don't know if range can change while iterating due to another thread modifying
-    //             info!(
-    //                 "retrieving oracle events from {} to {}",
-    //                 String::from_utf8_lossy(&start_key),
-    //                 String::from_utf8_lossy(&end_key),
-    //             );
-    //             return Ok(HttpResponse::Ok().json(
-    //                 oracle
-    //                     .event_database
-    //                     .range(start_key..=end_key)
-    //                     .map(|result| parse_database_entry(filters.asset_pair, result.unwrap()))
-    //                     .collect::<Vec<_>>(),
-    //             ));
-    //         }
-    //     },
-    // }
 }
 
 #[get("/announcement/{uuid}")]
@@ -700,7 +604,7 @@ async fn main() -> anyhow::Result<()> {
 
             // info!("scheduling oracle events for {}", asset_pair);
             // // schedule oracle events (announcements/attestations)
-            // oracle_scheduler::init(oracle.clone(), secp.clone(), pricefeeds)?;
+            // oracle_queryable::init(oracle.clone(), secp.clone(), pricefeeds)?;
 
             Ok(oracle)
         }))
