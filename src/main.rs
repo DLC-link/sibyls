@@ -148,10 +148,10 @@ pub fn build_announcement(
     event_id: String,
 ) -> Result<(Announcement, Vec<[u8; 32]>), secp256k1_zkp::UpstreamError> {
     let mut rng = rand::thread_rng();
-    let digits = 10; // This is always going to be 5 or so, because that's the precision we will have in our Alice/Bob contract
-    let mut sk_nonces = Vec::with_capacity(digits);
-    let mut nonces = Vec::with_capacity(digits);
-    for _ in 0..digits {
+    let num_digits = 10u16;
+    let mut sk_nonces = Vec::with_capacity(num_digits.into());
+    let mut nonces = Vec::with_capacity(num_digits.into());
+    for _ in 0..num_digits {
         let mut sk_nonce = [0u8; 32];
         rng.fill_bytes(&mut sk_nonce);
         let oracle_r_kp = secp256k1_zkp::KeyPair::from_seckey_slice(secp, &sk_nonce)?;
@@ -165,7 +165,7 @@ pub fn build_announcement(
         is_signed: false,
         unit: "BTCUSD".to_string(),
         precision: 0,
-        num_digits: 10, // This will be 5 or so, because of our 0-100.00 set of outcomes
+        num_digits,
     };
 
     let oracle_event = OracleEvent {
@@ -425,10 +425,6 @@ async fn get_announcement(
         filters.asset_pair,
         ((&**path).into(), event),
     )))
-    // Ok(HttpResponse::Ok().json(get_announcement_as_json(
-    //     filters.asset_pair,
-    //     ((&**path).into(), event),
-    // )))
 }
 
 #[get("/attestation/{rfc3339_time}")]
@@ -594,18 +590,6 @@ async fn main() -> anyhow::Result<()> {
             info!("creating oracle for {}", asset_pair);
             let oracle = Oracle::new(oracle_config, keypair, secp.clone())?;
 
-            // // pricefeed retreival
-            // info!("creating pricefeeds for {}", asset_pair);
-            // let pricefeeds: Vec<Box<dyn PriceFeed + Send + Sync>> = vec![
-            //     Box::new(Bitstamp {}),
-            //     Box::new(GateIo {}),
-            //     Box::new(Kraken {}),
-            // ];
-
-            // info!("scheduling oracle events for {}", asset_pair);
-            // // schedule oracle events (announcements/attestations)
-            // oracle_queryable::init(oracle.clone(), secp.clone(), pricefeeds)?;
-
             Ok(oracle)
         }))
         .map(|(asset_pair, oracle)| oracle.map(|ok| (asset_pair, ok)))
@@ -628,7 +612,7 @@ async fn main() -> anyhow::Result<()> {
             )
     })
     .bind(("0.0.0.0", 8080))?
-    // .bind(("54.198.187.245", 8080))?
+    // .bind(("54.198.187.245", 8080))? //TODO: Should we bind to only certain IPs for security?
     .run()
     .await?;
 
