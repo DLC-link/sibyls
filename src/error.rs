@@ -10,8 +10,11 @@ pub enum SibylsError {
     /// datetime RFC3339 parsing error: {0}
     DatetimeParseError(#[from] time::error::Parse),
 
-    /// oracle event with maturation {0} not found
+    /// oracle event with uuid {0} not found
     OracleEventNotFoundError(String),
+
+    /// an error occured within the cryptographic libraries.
+    SignatureError(String),
 
     /// database error: {0}
     DatabaseError(#[from] sled::Error),

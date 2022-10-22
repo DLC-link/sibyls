@@ -38,6 +38,7 @@ pub struct OracleEvent {
     pub nonces: Vec<SchnorrPublicKey>,
     pub maturation: OffsetDateTime,
     pub event_descriptor: EventDescriptor,
+    pub event_id: String,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -83,11 +84,12 @@ impl From<&OracleEvent> for dlc_messages::oracle_msgs::OracleEvent {
             .collect::<Vec<_>>();
         let event_maturity_epoch = event.maturation.unix_timestamp().try_into().unwrap();
         let event_descriptor = (&event.event_descriptor).into();
+        let event_id = event.event_id.to_string();
         Self {
             oracle_nonces,
             event_maturity_epoch,
             event_descriptor,
-            event_id: String::new(), // todo?
+            event_id,
         }
     }
 }
@@ -152,7 +154,7 @@ impl Writeable for BigSize {
 }
 
 impl Announcement {
-    pub fn encode(&self) -> Vec<u8> {
+    pub fn suredbits_encode(&self) -> Vec<u8> {
         let mut out = vec![];
         BigSize(55332_u64).write(&mut out).unwrap();
         let v = dlc_messages::oracle_msgs::OracleAnnouncement::from(self).encode();
@@ -160,6 +162,10 @@ impl Announcement {
         // extend manually for announcement to be consistent w suredbits decoding
         out.extend_from_slice(&v);
         out
+    }
+
+    pub fn encode(&self) -> Vec<u8> {
+        dlc_messages::oracle_msgs::OracleAnnouncement::from(self).encode()
     }
 }
 
@@ -170,10 +176,12 @@ impl OracleEvent {
 }
 
 impl Attestation {
-    pub fn encode(&self) -> Vec<u8> {
+    pub fn suredbits_encode(&self) -> Vec<u8> {
         let mut out = vec![];
         BigSize(55400_u64).write(&mut out).unwrap();
         let mut v = dlc_messages::oracle_msgs::OracleAttestation::from(self).encode();
+
+        // println!("Original V:\n{:?}", v);
 
         // remove duplicate length encoding from tibo's implementation
         let end = v.len() - 36;
@@ -181,10 +189,18 @@ impl Attestation {
 
         BigSize((v.len() + 1) as u64).write(&mut out).unwrap();
         // extend manually for attestation to be consistent w suredbits decoding
-        // also extend w dummy event id
+
         BigSize(0_u64).write(&mut out).unwrap();
         out.extend_from_slice(&v);
+        // println!("Original Out:\n{:?}", out);
+
+        // let new_v = out.clone();
+        // println!("Back to V:\n{:?}", &new_v[7..]);
         out
+    }
+
+    pub fn encode(&self) -> Vec<u8> {
+        dlc_messages::oracle_msgs::OracleAttestation::from(self).encode()
     }
 }
 
@@ -228,8 +244,9 @@ mod tests {
                 is_signed: false,
                 unit: "BTCUSD".to_string(),
                 precision: 0,
-                num_digits: 18,
+                num_digits: 10,
             },
+            event_id: "testeventid".to_string(),
         };
 
         let announcement = Announcement {
