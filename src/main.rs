@@ -148,7 +148,7 @@ pub fn build_announcement(
     event_id: String,
 ) -> Result<(Announcement, Vec<[u8; 32]>), secp256k1_zkp::UpstreamError> {
     let mut rng = rand::thread_rng();
-    let num_digits = 10u16;
+    let num_digits = 14u16;
     let mut sk_nonces = Vec::with_capacity(num_digits.into());
     let mut nonces = Vec::with_capacity(num_digits.into());
     for _ in 0..num_digits {
@@ -330,7 +330,23 @@ async fn attest(
 
     let outstanding_sk_nonces = event.clone().0.unwrap();
 
-    let num_digits_to_sign = 10;
+    let mut announcement_cursor = Cursor::new(&event.3);
+    let announcement =
+        <dlc_messages::oracle_msgs::OracleAnnouncement as lightning::util::ser::Readable>::read(
+            &mut announcement_cursor,
+        )
+        .unwrap();
+
+    let num_digits_to_sign = match announcement.oracle_event.event_descriptor {
+        dlc_messages::oracle_msgs::EventDescriptor::DigitDecompositionEvent(e) => e.nb_digits,
+        _ => {
+            return Err(SibylsError::OracleEventNotFoundError(
+                "Got an unexpected EventDescriptor type!".to_string(),
+            )
+            .into())
+        }
+    };
+
     // Here, we take the outcome of the DLC (0-10000), break it down into binary, break it into a vec of characters
     let outcomes = format!("{:0width$b}", outcome, width = num_digits_to_sign as usize)
         .chars()
