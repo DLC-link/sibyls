@@ -15,7 +15,10 @@ use secp256k1_zkp::{
     All, KeyPair, Message, Secp256k1, SecretKey, Signing, XOnlyPublicKey as SchnorrPublicKey,
 };
 use secp256k1_zkp_5::rand::RngCore;
-use std::io::{prelude::*, Cursor};
+use std::{
+    env,
+    io::{prelude::*, Cursor},
+};
 
 use serde::{Deserialize, Serialize};
 
@@ -500,7 +503,7 @@ async fn publickey() -> actix_web::Result<HttpResponse, actix_web::Error> {
     secret_key.retain(|c| !c.is_whitespace());
 
     let secret_key = match SecretKey::from_str(&secret_key) {
-        Ok(a) => (a),
+        Ok(a) => a,
         Err(_error) => return Err(SibylsError::SignatureError("path".to_string()).into()), //actix_web::Error(erro)
     };
 
@@ -527,7 +530,6 @@ struct Args {
 #[actix_web::main]
 async fn main() -> anyhow::Result<()> {
     env_logger::init();
-
     let args = Args::parse();
 
     let mut secret_key = String::new();
@@ -612,7 +614,11 @@ async fn main() -> anyhow::Result<()> {
         .collect::<anyhow::Result<HashMap<_, _>>>()?;
 
     // setup and run server
-    info!("starting server");
+    let port: u16 = env::var("ORACLE_PORT")
+        .unwrap_or("8080".to_string())
+        .parse()
+        .unwrap_or(8080);
+    info!("starting server on port {port}");
     HttpServer::new(move || {
         App::new()
             .app_data(web::Data::new(oracles.clone()))
@@ -627,7 +633,7 @@ async fn main() -> anyhow::Result<()> {
                     .service(create_event),
             )
     })
-    .bind(("0.0.0.0", 8080))?
+    .bind(("0.0.0.0", port))?
     // .bind(("54.198.187.245", 8080))? //TODO: Should we bind to only certain IPs for security?
     .run()
     .await?;
