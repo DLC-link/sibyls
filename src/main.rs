@@ -446,54 +446,6 @@ async fn get_announcement(
     )))
 }
 
-#[get("/attestation/{rfc3339_time}")]
-async fn get_attestation(
-    oracles: web::Data<HashMap<AssetPair, Oracle>>,
-    filters: web::Query<Filters>,
-    path: web::Path<String>,
-) -> actix_web::Result<HttpResponse, actix_web::Error> {
-    info!("GET /attestation/{}: {:#?}", path, filters);
-    let _ = OffsetDateTime::parse(&path, &Rfc3339).map_err(SibylsError::DatetimeParseError)?;
-
-    let oracle = match oracles.get(&filters.asset_pair) {
-        None => return Err(SibylsError::UnrecordedAssetPairError(filters.asset_pair).into()),
-        Some(val) => val,
-    };
-
-    if oracle.event_database.is_empty() {
-        info!("no oracle events found");
-        return Err(SibylsError::OracleEventNotFoundError(path.to_string()).into());
-    }
-
-    info!("retrieving oracle event with maturation {}", path);
-    let event = match oracle
-        .event_database
-        .get(path.as_bytes())
-        .map_err(SibylsError::DatabaseError)?
-    {
-        Some(val) => val,
-        None => return Err(SibylsError::OracleEventNotFoundError(path.to_string()).into()),
-    };
-    Ok(HttpResponse::Ok().json(parse_database_entry(
-        filters.asset_pair,
-        ((&**path).into(), event),
-    )))
-}
-
-#[get("/config")]
-async fn config(
-    oracles: web::Data<HashMap<AssetPair, Oracle>>,
-) -> actix_web::Result<HttpResponse, actix_web::Error> {
-    info!("GET /config");
-    Ok(HttpResponse::Ok().json(
-        oracles
-            .values()
-            .next()
-            .expect("no asset pairs recorded")
-            .oracle_config,
-    ))
-}
-
 #[get("/publickey")]
 async fn publickey() -> actix_web::Result<HttpResponse, actix_web::Error> {
     info!("GET /publickey");
