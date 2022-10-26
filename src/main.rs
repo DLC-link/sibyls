@@ -578,8 +578,6 @@ async fn main() -> anyhow::Result<()> {
                 web::scope("/v1")
                     .service(announcements)
                     .service(get_announcement)
-                    .service(get_attestation)
-                    .service(config)
                     .service(publickey)
                     .service(attest)
                     .service(create_event),
