@@ -89,7 +89,6 @@ impl Default for Filters {
 struct ApiOracleEvent {
     event_id: String,
     uuid: String,
-    asset_pair: AssetPair,
     suredbits_announcement: String,
     rust_announcement_json: String,
     rust_announcement: String,
@@ -100,11 +99,7 @@ struct ApiOracleEvent {
     outcome: Option<u64>,
 }
 
-fn parse_database_entry(
-    asset_pair: AssetPair,
-    (maturation, event): (IVec, IVec),
-) -> ApiOracleEvent {
-    let maturation = String::from_utf8_lossy(&maturation).to_string();
+fn parse_database_entry(event: IVec) -> ApiOracleEvent {
     let event: DbValue = serde_json::from_str(&String::from_utf8_lossy(&event)).unwrap();
 
     let mut announcement_cursor = Cursor::new(&event.3);
@@ -132,14 +127,16 @@ fn parse_database_entry(
     ApiOracleEvent {
         event_id: decoded_announcement.oracle_event.event_id.clone(),
         uuid: event.6,
-        asset_pair,
         suredbits_announcement: event.1.encode_hex::<String>(),
         rust_announcement_json: decoded_ann_json,
         rust_announcement: event.3.encode_hex::<String>(),
         suredbits_attestation: event.2.map(|att| att.encode_hex::<String>()),
         rust_attestation_json: decoded_att_json,
         rust_attestation: event.4.map(|att| att.encode_hex::<String>()),
-        maturation,
+        maturation: decoded_announcement
+            .oracle_event
+            .event_maturity_epoch
+            .to_string(),
         outcome: event.5,
     }
 }
@@ -272,11 +269,6 @@ async fn create_event(
     )
     .unwrap();
 
-    let response = format!(
-        "creating oracle event (announcement only) with uuid {} and maturation {}",
-        uuid, maturation
-    );
-
     let db_value = DbValue(
         Some(outstanding_sk_nonces),
         announcement_obj.suredbits_encode(),
@@ -287,15 +279,14 @@ async fn create_event(
         uuid.clone(),
     );
 
+    let new_event = serde_json::to_string(&db_value)?.into_bytes();
+
     oracle
         .event_database
-        .insert(
-            uuid.into_bytes(),
-            serde_json::to_string(&db_value)?.into_bytes(),
-        )
+        .insert(uuid.clone().into_bytes(), new_event.clone())
         .unwrap();
 
-    Ok(HttpResponse::Ok().json(response))
+    Ok(HttpResponse::Ok().json(parse_database_entry(new_event.into())))
 }
 
 #[get("/attest/{uuid}")]
@@ -304,7 +295,7 @@ async fn attest(
     filters: web::Query<Filters>,
     path: web::Path<String>,
 ) -> actix_web::Result<HttpResponse, actix_web::Error> {
-    info!("GET /announcement/{}: {:#?}", path, filters);
+    info!("GET /attest/{}: {:#?}", path, filters);
     let uuid = path.to_string();
     let outcome = &filters.outcome.unwrap();
 
@@ -328,7 +319,7 @@ async fn attest(
         None => return Err(SibylsError::OracleEventNotFoundError(uuid).into()),
     };
 
-    let thing = parse_database_entry(filters.asset_pair, ((&**path).into(), event_ivec.clone()));
+    // let thing = parse_database_entry(event_ivec.clone());
     let mut event: DbValue = serde_json::from_str(&String::from_utf8_lossy(&event_ivec)).unwrap();
 
     let outstanding_sk_nonces = event.clone().0.unwrap();
@@ -372,19 +363,18 @@ async fn attest(
         path, attestation
     );
 
+    let new_event = serde_json::to_string(&event)?.into_bytes();
+
     let _insert_event = match oracle
         .event_database
-        .insert(
-            path.clone().as_bytes(),
-            serde_json::to_string(&event)?.into_bytes(),
-        )
+        .insert(path.clone().as_bytes(), new_event.clone())
         .map_err(SibylsError::DatabaseError)?
     {
         Some(val) => val,
         None => return Err(SibylsError::OracleEventNotFoundError(uuid).into()),
     };
 
-    Ok(HttpResponse::Ok().json(thing))
+    Ok(HttpResponse::Ok().json(parse_database_entry(new_event.into())))
 }
 
 #[get("/announcements")]
@@ -407,7 +397,7 @@ async fn announcements(
         oracle
             .event_database
             .iter()
-            .map(|result| parse_database_entry(filters.asset_pair, result.unwrap()))
+            .map(|result| parse_database_entry(result.unwrap().1))
             .collect::<Vec<_>>(),
     ));
 }
@@ -440,10 +430,7 @@ async fn get_announcement(
         Some(val) => val,
         None => return Err(SibylsError::OracleEventNotFoundError(path.to_string()).into()),
     };
-    Ok(HttpResponse::Ok().json(parse_database_entry(
-        filters.asset_pair,
-        ((&**path).into(), event),
-    )))
+    Ok(HttpResponse::Ok().json(parse_database_entry(event)))
 }
 
 #[get("/publickey")]
